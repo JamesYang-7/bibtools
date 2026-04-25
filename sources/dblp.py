@@ -36,8 +36,14 @@ def _hit_authors(info: dict) -> list[str]:
     return out
 
 
-def _strip_dblp_fields(bibtex: str) -> str:
-    """Remove DBLP-specific metadata (timestamp, biburl, bibsource)."""
+def _strip_dblp_fields(bibtex: str, drop_metadata: bool = False) -> str:
+    """Optionally remove DBLP-internal metadata (timestamp, biburl, bibsource).
+
+    Default is to keep every field DBLP returns. Pass drop_metadata=True to
+    strip the bookkeeping fields (matches the pre-1.1 behavior).
+    """
+    if not drop_metadata:
+        return bibtex
     skip_prefixes = ("timestamp", "biburl", "bibsource")
     return "\n".join(
         line for line in bibtex.split("\n")

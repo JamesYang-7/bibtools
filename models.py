@@ -171,6 +171,9 @@ class SearchReport:
         if bsrc:
             srcs = ", ".join(f"{k}={v}" for k, v in sorted(bsrc.items()))
             print(f"By source: {srcs}", file=fh)
+
+        self.print_unresolved(fh)
+
         return {
             "total": total,
             "exact": exact,
@@ -179,6 +182,49 @@ class SearchReport:
             "by_status": bs,
             "by_source": bsrc,
         }
+
+    def print_unresolved(self, fh=None) -> None:
+        """List every non-exact entry (fuzzy + not_found) with title and author."""
+        import sys
+        fh = fh or sys.stdout
+        non_exact = [r for r in self.results if r.status != "exact"]
+        if not non_exact:
+            return
+
+        # Group by status for readability
+        groups: dict[str, list[MatchResult]] = {}
+        for r in non_exact:
+            groups.setdefault(r.status, []).append(r)
+
+        # Stable order: pending review first, then confirmed, rejected, skipped, not_found
+        status_order = ["fuzzy_pending", "fuzzy_confirmed", "fuzzy_rejected",
+                        "fuzzy_skipped", "not_found"]
+        labels = {
+            "fuzzy_pending":   "Fuzzy (pending review)",
+            "fuzzy_confirmed": "Fuzzy (user confirmed)",
+            "fuzzy_rejected":  "Fuzzy (user rejected)",
+            "fuzzy_skipped":   "Fuzzy (user skipped)",
+            "not_found":       "Not found",
+        }
+
+        print("", file=fh)
+        print("-" * 60, file=fh)
+        print("Non-exact entries (title / author):", file=fh)
+        print("-" * 60, file=fh)
+        for status in status_order:
+            items = groups.get(status, [])
+            if not items:
+                continue
+            print(f"\n[{labels[status]}]  ({len(items)})", file=fh)
+            for r in items:
+                q = r.query
+                ident = q.id or "?"
+                author = q.author or "(no author)"
+                year = f" ({q.year})" if q.year else ""
+                print(f"  - {ident}: {q.title!r}", file=fh)
+                print(f"      by {author}{year}", file=fh)
+                if r.mismatches:
+                    print(f"      mismatch: {'; '.join(r.mismatches)}", file=fh)
 
     def write_json(self, path: str | Path) -> None:
         Path(path).write_text(
