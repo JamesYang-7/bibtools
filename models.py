@@ -98,6 +98,20 @@ class MatchResult:
     def canonical_key(self) -> str | None:
         return self.chosen.canonical_key if self.chosen else None
 
+    @property
+    def bib_fetch_failed(self) -> bool:
+        """True iff search matched but BibTeX retrieval failed/skipped.
+
+        Distinct from `not_found`: the entry was matched in a source, but
+        the lazy `fetch_bibtex` call afterwards either raised or was never
+        attempted, leaving `chosen.bibtex == None`.
+        """
+        return bool(
+            self.chosen
+            and not self.chosen.bibtex
+            and self.status in ("exact", "fuzzy_confirmed", "fuzzy_pending")
+        )
+
     def to_dict(self) -> dict:
         d = {
             "id": self.query.id,
@@ -105,6 +119,7 @@ class MatchResult:
             "source": self.source,
             "canonical_key": self.canonical_key,
             "score": round(self.chosen.score, 3) if self.chosen else None,
+            "bib_fetch_failed": self.bib_fetch_failed,
             "mismatches": self.mismatches,
             "user_decision": self.user_decision,
             "query": {
@@ -152,6 +167,10 @@ class SearchReport:
         pending = bs.get("fuzzy_pending", 0)
         not_found = bs.get("not_found", 0)
         total = len(self.results)
+        # Search-matched entries whose BibTeX retrieval did not produce a
+        # bib record (transient fetch failure). These would otherwise be
+        # silently downgraded to manual stubs in the .bib file.
+        fetch_failed = sum(1 for r in self.results if r.bib_fetch_failed)
 
         fuzzy_total = confirmed + rejected + skipped + pending
         fuzzy_breakdown = []
@@ -168,6 +187,9 @@ class SearchReport:
         print(f"Exact matches:     {exact:>4}  (auto-accepted)", file=fh)
         print(f"Fuzzy matches:     {fuzzy_total:>4}{fuzzy_str}", file=fh)
         print(f"Not found:         {not_found:>4}", file=fh)
+        if fetch_failed:
+            print(f"BibTeX fetch failed:{fetch_failed:>4}  "
+                  f"(search matched, bib not retrieved)", file=fh)
         if bsrc:
             srcs = ", ".join(f"{k}={v}" for k, v in sorted(bsrc.items()))
             print(f"By source: {srcs}", file=fh)
@@ -179,6 +201,7 @@ class SearchReport:
             "exact": exact,
             "fuzzy": fuzzy_total,
             "not_found": not_found,
+            "fetch_failed": fetch_failed,
             "by_status": bs,
             "by_source": bsrc,
         }

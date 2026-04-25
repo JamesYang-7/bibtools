@@ -1,13 +1,15 @@
 """DBLP search backend.
 
 Ported from paper_writing/fetch_bibtex.py:search_dblp +
-paper_writing/verify_dblp.py:fetch_dblp.
+paper_writing/verify_dblp.py:fetch_dblp. Search hits land in
+`MatchCandidate.raw` so that `fetch_bibtex` can synthesize a BibTeX
+entry locally without a second HTTP round-trip — matching the contract
+of the crossref/openalex/arxiv backends.
 """
 
 from __future__ import annotations
 
 import json
-import re
 import urllib.parse
 
 from ..http import http_get
@@ -15,7 +17,6 @@ from ..models import MatchCandidate, PaperQuery
 from ..normalize import title_similarity, year_diff
 
 DBLP_SEARCH_URL = "https://dblp.org/search/publ/api"
-DBLP_BIB_URL = "https://dblp.org/rec/{key}.bib"
 
 
 def _hit_authors(info: dict) -> list[str]:
@@ -36,19 +37,74 @@ def _hit_authors(info: dict) -> list[str]:
     return out
 
 
-def _strip_dblp_fields(bibtex: str, drop_metadata: bool = False) -> str:
-    """Optionally remove DBLP-internal metadata (timestamp, biburl, bibsource).
+def _bib_type_for(info: dict) -> tuple[str, str]:
+    """Map DBLP's `type` label to (bibtex_entry_type, venue_field_name).
 
-    Default is to keep every field DBLP returns. Pass drop_metadata=True to
-    strip the bookkeeping fields (matches the pre-1.1 behavior).
+    Defaults to inproceedings/booktitle for unknown types — matches the
+    most common case in our workload.
     """
-    if not drop_metadata:
-        return bibtex
-    skip_prefixes = ("timestamp", "biburl", "bibsource")
-    return "\n".join(
-        line for line in bibtex.split("\n")
-        if not line.strip().lower().startswith(skip_prefixes)
-    )
+    t = info.get("type", "")
+    if "Journal" in t:
+        return "article", "journal"
+    if "Book" in t or "Thes" in t:
+        return "book", "publisher"
+    if "Informal" in t:                # arXiv / preprints
+        return "article", "journal"    # DBLP canonical: @article + journal=CoRR
+    if "Reference" in t or "Editorship" in t:
+        return "misc", "howpublished"
+    return "inproceedings", "booktitle"
+
+
+def _synthesize_bibtex(info: dict, dblp_id: str) -> str:
+    """Build a BibTeX entry locally from a DBLP search-response info dict.
+
+    Includes every field present in `info` that maps to a standard BibTeX
+    slot (no filtering); supplements with the deterministic `biburl` and
+    `bibsource` fields DBLP attaches to its canonical /rec/{key}.bib
+    output. Fields the search response does not carry — long booktitle,
+    publisher, timestamp — are not fabricated; eliminating them is the
+    deliberate trade for skipping the second HTTP round-trip.
+    """
+    bib_type, venue_field = _bib_type_for(info)
+    key = f"DBLP:{dblp_id}"
+
+    fields: list[tuple[str, str]] = []
+
+    authors = _hit_authors(info)
+    if authors:
+        fields.append(("author", " and\n                  ".join(authors)))
+
+    title = info.get("title", "").rstrip(".")
+    if title:
+        fields.append(("title", title))
+
+    venue = info.get("venue")
+    if venue:
+        fields.append((venue_field, venue))
+
+    for src_key, bib_key in (
+        ("volume", "volume"),
+        ("number", "number"),
+        ("pages", "pages"),
+        ("year", "year"),
+        ("doi", "doi"),
+        ("ee", "url"),                 # electronic-edition URL
+    ):
+        v = info.get(src_key)
+        if v:
+            fields.append((bib_key, str(v)))
+
+    # Deterministic bookkeeping that DBLP's canonical .bib also attaches.
+    fields.append(("biburl", f"https://dblp.org/rec/{dblp_id}.bib"))
+    fields.append(("bibsource",
+                   "dblp computer science bibliography, https://dblp.org"))
+
+    lines = [f"@{bib_type}{{{key},"]
+    for i, (name, value) in enumerate(fields):
+        sep = "," if i < len(fields) - 1 else ""
+        lines.append(f"  {name:<12} = {{{value}}}{sep}")
+    lines.append("}")
+    return "\n".join(lines)
 
 
 def _prefer_canonical_key(hits: list[dict], query_title: str,
@@ -83,13 +139,15 @@ class DBLPSource:
             try:
                 data = http_get(url, verbose=verbose)
             except RuntimeError as e:
-                if verbose:
-                    print(f"  DBLP request failed: {e}")
+                print(f"  WARN DBLP search request failed for {q!r}: "
+                      f"{type(e).__name__}: {e}")
                 continue
 
             try:
                 result = json.loads(data)
-            except json.JSONDecodeError:
+            except json.JSONDecodeError as e:
+                print(f"  WARN DBLP returned non-JSON for {q!r}: "
+                      f"{type(e).__name__}: {e}")
                 continue
             hits = result.get("result", {}).get("hits", {}).get("hit", [])
 
@@ -128,12 +186,18 @@ class DBLPSource:
 
     def fetch_bibtex(self, candidate: MatchCandidate, *,
                      verbose: bool = False) -> str:
+        """Synthesize BibTeX from the search-time `info` payload — no HTTP.
+
+        Avoiding the canonical /rec/{key}.bib endpoint eliminates the
+        most rate-limit-prone HTTP round-trip in the pipeline and brings
+        DBLP into parity with the other backends, which all build bib
+        locally from their cached search responses.
+        """
+        info = candidate.raw or {}
+        if not info:
+            raise RuntimeError(
+                "DBLP candidate missing search-time `info` payload "
+                "(was the candidate created by an older bibtools version?)"
+            )
         dblp_id = candidate.canonical_key.removeprefix("DBLP:")
-        bib = http_get(DBLP_BIB_URL.format(key=dblp_id), verbose=verbose)
-        bib = _strip_dblp_fields(bib)
-        # Re-key in case DBLP returns a different cite key than the search did
-        # (rare, but happens for crossref-style entries)
-        m = re.search(r'@\w+\{([^,]+),', bib)
-        if m and m.group(1) != f"DBLP:{dblp_id}":
-            bib = bib.replace(m.group(1), f"DBLP:{dblp_id}", 1)
-        return bib.strip()
+        return _synthesize_bibtex(info, dblp_id)

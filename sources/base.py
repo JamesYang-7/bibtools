@@ -14,9 +14,15 @@ class SourceBackend(Protocol):
     `name` is the short string used in source lists and reports.
     `search` returns a list of MatchCandidate sorted by score (best first).
     `fetch_bibtex` returns a BibTeX string for an accepted candidate.
+    `fetch_makes_http`: True iff `fetch_bibtex` performs an HTTP round-trip.
+        When False (the default), the backend synthesizes BibTeX locally
+        from the search-time payload in `candidate.raw`. The cascade
+        scheduler uses this to skip the inter-fetch `api_delay` sleep
+        when no network call was actually issued.
     """
 
     name: str
+    fetch_makes_http: bool = False
 
     def search(self, query: PaperQuery, *, max_hits: int = 5,
                verbose: bool = False) -> list[MatchCandidate]: ...

@@ -27,8 +27,8 @@ def main(argv: list[str] | None = None) -> int:
                    help=f"Sources to query, in cascade order (default: {' '.join(DEFAULT_ORDER)})")
     p.add_argument("--no-interactive", action="store_true",
                    help="Skip phase-2 review of fuzzy matches")
-    p.add_argument("--api-delay", type=float, default=1.0,
-                   help="Seconds between API calls (default: 1.0)")
+    p.add_argument("--api-delay", type=float, default=3.0,
+                   help="Seconds between API calls (default: 3.0)")
     p.add_argument("--max-hits", type=int, default=5,
                    help="Candidates per source (default: 5)")
     p.add_argument("--verbose", action="store_true")

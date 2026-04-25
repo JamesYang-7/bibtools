@@ -95,13 +95,15 @@ class OpenAlexSource:
         try:
             data = http_get(url, verbose=verbose)
         except RuntimeError as e:
-            if verbose:
-                print(f"  OpenAlex request failed: {e}")
+            print(f"  WARN OpenAlex search request failed for {query.title!r}: "
+                  f"{type(e).__name__}: {e}")
             return []
 
         try:
             result = json.loads(data)
-        except json.JSONDecodeError:
+        except json.JSONDecodeError as e:
+            print(f"  WARN OpenAlex returned non-JSON for {query.title!r}: "
+                  f"{type(e).__name__}: {e}")
             return []
 
         works = result.get("results", [])

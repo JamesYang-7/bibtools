@@ -179,4 +179,8 @@ Module-level constants in `http.py`:
 
 - `DEFAULT_TIMEOUT = 15`
 - `DEFAULT_RETRIES = 3`
-- `DEFAULT_API_DELAY = 3.0`
+- `DEFAULT_API_DELAY = 3.0` (used as the default `--api-delay` / `api_delay=` value in `cli.py` and `search.py`)
+
+DBLP, CrossRef, OpenAlex, and arXiv all synthesize BibTeX locally from
+the search-time response payload in `MatchCandidate.raw`, so
+`fetch_bibtex` never makes a second HTTP round-trip per accepted entry.

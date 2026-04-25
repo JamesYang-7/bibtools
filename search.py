@@ -131,7 +131,7 @@ def search_papers(
     interactive: bool = True,
     out_json: str | Path | None = None,
     out_bib: str | Path | None = None,
-    api_delay: float = 1.0,
+    api_delay: float = 3.0,
     max_hits: int = 5,
     verbose: bool = False,
     fetch_bibtex_for_fuzzy: bool = True,
@@ -183,6 +183,7 @@ def search_papers(
                      if r.status == "fuzzy_pending" and r.chosen]
 
     print(f"\nFetching BibTeX for {len(accepted)} accepted entries...")
+    n_fetch_failed = 0
     for r in accepted:
         if r.chosen and r.chosen.bibtex is None:
             backend = SOURCES.get(r.chosen.source)
@@ -191,10 +192,20 @@ def search_papers(
             try:
                 r.chosen.bibtex = backend.fetch_bibtex(r.chosen, verbose=verbose)
             except Exception as e:
-                if verbose:
-                    print(f"  bibtex fetch failed for {r.canonical_key}: {e}")
-            if api_delay > 0:
+                # Print unconditionally so silent fetch failures don't
+                # quietly downgrade matched entries to manual stubs.
+                n_fetch_failed += 1
+                print(f"  WARN bibtex fetch failed for {r.canonical_key}: "
+                      f"{type(e).__name__}: {e}")
+            # Only sleep if the backend actually issued an HTTP call.
+            # Synthesis-only backends (all four current ones) finish in
+            # microseconds — a 3s sleep there is pure waiting.
+            if api_delay > 0 and getattr(backend, "fetch_makes_http", False):
                 time.sleep(api_delay)
+    if n_fetch_failed:
+        print(f"\n!! {n_fetch_failed}/{len(accepted)} BibTeX fetches failed. "
+              f"Affected entries appear as FETCH_FAILED stubs in the .bib output "
+              f"with the canonical key + manual-fetch URL preserved.")
 
     report = SearchReport(results=results)
 

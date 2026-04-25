@@ -98,13 +98,15 @@ class CrossRefSource:
         try:
             data = http_get(url, verbose=verbose)
         except RuntimeError as e:
-            if verbose:
-                print(f"  CrossRef request failed: {e}")
+            print(f"  WARN CrossRef search request failed for {query.title!r}: "
+                  f"{type(e).__name__}: {e}")
             return []
 
         try:
             result = json.loads(data)
-        except json.JSONDecodeError:
+        except json.JSONDecodeError as e:
+            print(f"  WARN CrossRef returned non-JSON for {query.title!r}: "
+                  f"{type(e).__name__}: {e}")
             return []
 
         items = result.get("message", {}).get("items", [])

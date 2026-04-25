@@ -105,13 +105,15 @@ class ArXivSource:
         try:
             data = http_get(url, verbose=verbose)
         except RuntimeError as e:
-            if verbose:
-                print(f"  arXiv request failed: {e}")
+            print(f"  WARN arXiv search request failed for {query.title!r}: "
+                  f"{type(e).__name__}: {e}")
             return []
 
         try:
             root = ET.fromstring(data)
-        except ET.ParseError:
+        except ET.ParseError as e:
+            print(f"  WARN arXiv returned non-XML for {query.title!r}: "
+                  f"{type(e).__name__}: {e}")
             return []
 
         candidates: list[MatchCandidate] = []
