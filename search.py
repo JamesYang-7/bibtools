@@ -1,0 +1,210 @@
+"""Search orchestrator: cascade across sources, classify each query."""
+
+from __future__ import annotations
+
+import time
+from pathlib import Path
+
+from .bibtex import write_bib_file
+from .interactive import interactive_review
+from .models import MatchCandidate, MatchResult, PaperQuery, SearchReport
+from .normalize import author_match, title_similarity, year_diff
+from .sources import DEFAULT_ORDER, SOURCES
+
+# Tunable thresholds — overridable via search_papers() kwargs
+EXACT_TITLE_THRESHOLD = 0.95
+FUZZY_TITLE_THRESHOLD = 0.75
+ACCEPTABLE_YEAR_DIFF = 2          # |query_year - hit_year| considered "close"
+
+
+def classify(query: PaperQuery, candidate: MatchCandidate, *,
+             exact_threshold: float = EXACT_TITLE_THRESHOLD,
+             fuzzy_threshold: float = FUZZY_TITLE_THRESHOLD,
+             year_tolerance: int = ACCEPTABLE_YEAR_DIFF,
+             ) -> tuple[str, list[str]]:
+    """Classify a (query, candidate) pair.
+
+    Returns (status, mismatches). status is one of: "exact", "fuzzy", "weak".
+    "weak" means below fuzzy threshold — caller should treat as no match.
+    """
+    sim = title_similarity(query.title, candidate.title)
+    mismatches: list[str] = []
+
+    if sim < fuzzy_threshold:
+        return "weak", [f"title similarity {sim:.2f} < {fuzzy_threshold}"]
+
+    # Below exact title threshold -> always fuzzy
+    if sim < exact_threshold:
+        mismatches.append(f"title similarity {sim:.2f}")
+
+    # Year check
+    if query.year and candidate.year:
+        yd = year_diff(query.year, candidate.year)
+        if yd is None:
+            mismatches.append(f"year unparseable: query={query.year} hit={candidate.year}")
+        elif yd > 0:
+            tag = " (close)" if yd <= year_tolerance else " (far)"
+            mismatches.append(f"year: {query.year} -> {candidate.year}{tag}")
+            if yd > year_tolerance:
+                # Strong signal of a wrong match; force fuzzy
+                pass
+
+    # Author check
+    if query.author and candidate.authors:
+        if not author_match(query.author, candidate.authors):
+            mismatches.append(
+                f"author mismatch: query={query.author!r} "
+                f"hit={candidate.authors[:2]}"
+            )
+
+    if mismatches:
+        return "fuzzy", mismatches
+    return "exact", []
+
+
+def _search_one(query: PaperQuery, source_names: list[str],
+                api_delay: float, max_hits: int, verbose: bool,
+                ) -> MatchResult:
+    """Cascade through sources for one query, classify, return MatchResult."""
+    all_candidates: list[MatchCandidate] = []
+    best: MatchCandidate | None = None
+    best_status = "weak"
+    best_mismatches: list[str] = []
+
+    for src_name in source_names:
+        backend = SOURCES.get(src_name)
+        if backend is None:
+            if verbose:
+                print(f"  unknown source: {src_name}")
+            continue
+
+        cands = backend.search(query, max_hits=max_hits, verbose=verbose)
+        all_candidates.extend(cands)
+
+        for cand in cands:
+            status, mismatches = classify(query, cand)
+            if status == "weak":
+                continue
+            # Prefer exact > fuzzy; within same status, prefer higher score
+            better = (
+                (status == "exact" and best_status != "exact") or
+                (status == best_status and (best is None or cand.score > best.score))
+            )
+            if better:
+                best = cand
+                best_status = status
+                best_mismatches = mismatches
+
+        # Stop cascading the moment we have an exact match
+        if best_status == "exact":
+            break
+
+        if api_delay > 0:
+            time.sleep(api_delay)
+
+    # De-dup all_candidates by (source, canonical_key) and sort
+    seen = set()
+    unique_cands = []
+    for c in sorted(all_candidates, key=lambda c: c.score, reverse=True):
+        sig = (c.source, c.canonical_key)
+        if sig in seen:
+            continue
+        seen.add(sig)
+        unique_cands.append(c)
+
+    if best is None:
+        return MatchResult(query=query, status="not_found", candidates=unique_cands)
+
+    if best_status == "exact":
+        return MatchResult(query=query, status="exact", chosen=best,
+                           candidates=unique_cands, mismatches=best_mismatches)
+
+    # fuzzy
+    return MatchResult(query=query, status="fuzzy_pending", chosen=best,
+                       candidates=unique_cands, mismatches=best_mismatches)
+
+
+def search_papers(
+    queries: list[PaperQuery],
+    *,
+    sources: list[str] | None = None,
+    interactive: bool = True,
+    out_json: str | Path | None = None,
+    out_bib: str | Path | None = None,
+    api_delay: float = 1.0,
+    max_hits: int = 5,
+    verbose: bool = False,
+    fetch_bibtex_for_fuzzy: bool = True,
+) -> SearchReport:
+    """Search each query across `sources` (cascading order) and classify.
+
+    Args:
+        queries: list of PaperQuery objects.
+        sources: ordered list of source names; defaults to DEFAULT_ORDER.
+        interactive: if True, prompt user to confirm each fuzzy match.
+        out_json: optional path to write per-entry results JSON.
+        out_bib: optional path to write a .bib file.
+        api_delay: seconds between source queries (politeness; per-query).
+        max_hits: candidates per source per query.
+        verbose: print extra progress info.
+        fetch_bibtex_for_fuzzy: fetch BibTeX for fuzzy entries even if user
+            doesn't confirm them (so the .bib file has placeholders).
+    """
+    source_names = sources or DEFAULT_ORDER
+    results: list[MatchResult] = []
+
+    print(f"Searching {len(queries)} queries across {source_names}...")
+    for i, q in enumerate(queries, 1):
+        label = q.id or f"#{i}"
+        print(f"[{i}/{len(queries)}] {label}: {q.title[:70]}")
+        result = _search_one(q, source_names, api_delay, max_hits, verbose)
+        if result.status == "exact":
+            print(f"   -> EXACT  ({result.source}: {result.canonical_key})")
+        elif result.status == "fuzzy_pending":
+            print(f"   -> FUZZY  ({result.source}: {result.canonical_key})  "
+                  f"{'; '.join(result.mismatches)}")
+        else:
+            print(f"   -> NOT FOUND")
+        results.append(result)
+        if api_delay > 0:
+            time.sleep(api_delay)
+
+    # Phase 2: interactive review of fuzzy entries
+    if interactive:
+        fuzzy = [r for r in results if r.status == "fuzzy_pending"]
+        if fuzzy:
+            interactive_review(fuzzy)
+
+    # Fetch BibTeX for accepted entries
+    accepted = [r for r in results
+                if r.status in ("exact", "fuzzy_confirmed") and r.chosen]
+    if fetch_bibtex_for_fuzzy:
+        accepted += [r for r in results
+                     if r.status == "fuzzy_pending" and r.chosen]
+
+    print(f"\nFetching BibTeX for {len(accepted)} accepted entries...")
+    for r in accepted:
+        if r.chosen and r.chosen.bibtex is None:
+            backend = SOURCES.get(r.chosen.source)
+            if backend is None:
+                continue
+            try:
+                r.chosen.bibtex = backend.fetch_bibtex(r.chosen, verbose=verbose)
+            except Exception as e:
+                if verbose:
+                    print(f"  bibtex fetch failed for {r.canonical_key}: {e}")
+            if api_delay > 0:
+                time.sleep(api_delay)
+
+    report = SearchReport(results=results)
+
+    if out_json:
+        report.write_json(out_json)
+        print(f"Per-entry results -> {out_json}")
+    if out_bib:
+        write_bib_file(results, out_bib)
+        print(f"BibTeX -> {out_bib}")
+
+    print()
+    report.summary()
+    return report
