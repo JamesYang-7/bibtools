@@ -11,7 +11,7 @@ import urllib.parse
 
 from ..http import http_get
 from ..models import MatchCandidate, PaperQuery
-from ..normalize import title_similarity, year_diff
+from ..normalize import title_search_variants, title_similarity, year_diff
 
 OPENALEX_URL = "https://api.openalex.org/works"
 
@@ -87,22 +87,40 @@ class OpenAlexSource:
 
     def search(self, query: PaperQuery, *, max_hits: int = 5,
                verbose: bool = False) -> list[MatchCandidate]:
+        for vi, t_variant in enumerate(title_search_variants(query.title)):
+            candidates = self._search_one_variant(t_variant, query,
+                                                  max_hits=max_hits,
+                                                  verbose=verbose)
+            if candidates:
+                if vi > 0:
+                    msg = (f"matched OpenAlex via normalized title "
+                           f"{t_variant!r} (original {query.title!r} "
+                           f"returned no hits)")
+                    print(f"  WARN openalex: {msg}")
+                    for c in candidates:
+                        c.warnings.append(msg)
+                return candidates
+        return []
+
+    def _search_one_variant(self, t_query: str, query: PaperQuery, *,
+                            max_hits: int, verbose: bool
+                            ) -> list[MatchCandidate]:
         params = urllib.parse.urlencode({
-            "search": query.title,
+            "search": t_query,
             "per-page": str(max_hits),
         })
         url = f"{OPENALEX_URL}?{params}"
         try:
             data = http_get(url, verbose=verbose)
         except RuntimeError as e:
-            print(f"  WARN OpenAlex search request failed for {query.title!r}: "
+            print(f"  WARN OpenAlex search request failed for {t_query!r}: "
                   f"{type(e).__name__}: {e}")
             return []
 
         try:
             result = json.loads(data)
         except json.JSONDecodeError as e:
-            print(f"  WARN OpenAlex returned non-JSON for {query.title!r}: "
+            print(f"  WARN OpenAlex returned non-JSON for {t_query!r}: "
                   f"{type(e).__name__}: {e}")
             return []
 
@@ -112,6 +130,7 @@ class OpenAlexSource:
             wt = w.get("title") or ""
             if not wt:
                 continue
+            # Score against the original (un-normalized) title.
             score = title_similarity(query.title, wt)
             wy = str(w.get("publication_year", ""))
             yd = year_diff(query.year, wy)

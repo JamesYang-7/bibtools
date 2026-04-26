@@ -12,7 +12,7 @@ import xml.etree.ElementTree as ET
 
 from ..http import http_get
 from ..models import MatchCandidate, PaperQuery
-from ..normalize import title_similarity, year_diff
+from ..normalize import title_search_variants, title_similarity, year_diff
 
 ARXIV_URL = "http://export.arxiv.org/api/query"
 ATOM_NS = {"a": "http://www.w3.org/2005/Atom",
@@ -88,8 +88,26 @@ class ArXivSource:
 
     def search(self, query: PaperQuery, *, max_hits: int = 5,
                verbose: bool = False) -> list[MatchCandidate]:
+        for vi, t_variant in enumerate(title_search_variants(query.title)):
+            candidates = self._search_one_variant(t_variant, query,
+                                                  max_hits=max_hits,
+                                                  verbose=verbose)
+            if candidates:
+                if vi > 0:
+                    msg = (f"matched arXiv via normalized title "
+                           f"{t_variant!r} (original {query.title!r} "
+                           f"returned no hits)")
+                    print(f"  WARN arxiv: {msg}")
+                    for c in candidates:
+                        c.warnings.append(msg)
+                return candidates
+        return []
+
+    def _search_one_variant(self, t_query: str, query: PaperQuery, *,
+                            max_hits: int, verbose: bool
+                            ) -> list[MatchCandidate]:
         # Build a structured search: title AND optional author surname
-        terms = [f'ti:"{query.title}"']
+        terms = [f'ti:"{t_query}"']
         if query.author:
             from ..normalize import first_author_surname
             sn = first_author_surname(query.author)
@@ -105,14 +123,14 @@ class ArXivSource:
         try:
             data = http_get(url, verbose=verbose)
         except RuntimeError as e:
-            print(f"  WARN arXiv search request failed for {query.title!r}: "
+            print(f"  WARN arXiv search request failed for {t_query!r}: "
                   f"{type(e).__name__}: {e}")
             return []
 
         try:
             root = ET.fromstring(data)
         except ET.ParseError as e:
-            print(f"  WARN arXiv returned non-XML for {query.title!r}: "
+            print(f"  WARN arXiv returned non-XML for {t_query!r}: "
                   f"{type(e).__name__}: {e}")
             return []
 
@@ -123,6 +141,7 @@ class ArXivSource:
             if not title:
                 continue
 
+            # Score against the original (un-normalized) title.
             score = title_similarity(query.title, title)
             yr = _entry_year(entry)
             yd = year_diff(query.year, yr)

@@ -87,6 +87,27 @@ The first **exact** match short-circuits the cascade. Fuzzy matches are
 collected from all sources before classification, so the user sees the best
 candidate available.
 
+### Title-variant fallback for special characters
+
+DBLP and other indices tokenize titles as words and silently drop characters
+like `^`, `_`, Unicode super/subscripts, and Unicode dashes. A query like
+`HMD^2: …` returns *zero* hits because `^2` is not in any token; meanwhile
+the paper is indexed under `HMD2`. To handle this, every backend's
+`search()` tries `title_search_variants(title)` in order:
+
+1. Original title — preserves behavior on clean inputs (no extra HTTP).
+2. Normalized title — rare chars **cut** (not space-replaced; `HMD^2 → HMD2`,
+   not `HMD 2`, because the index sees `HMD2` as one token).
+   Translates Unicode super/subscripts (`²` → `2`) and Unicode dashes
+   (U+2010..U+2015 → ASCII `-`).
+3. Pre-colon base form — strips subtitles when the main title has ≥ 3 words.
+
+The first variant that returns hits wins. When a non-original variant wins,
+every emitted `MatchCandidate` gets a `warnings` entry (visible in
+`results.json` under `matched.warnings`) and bibtools prints a `WARN <src>`
+line to stdout — so the user sees in the log exactly which queries needed
+normalization and can sanity-check.
+
 ## Output report
 
 ```

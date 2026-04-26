@@ -10,7 +10,7 @@ import urllib.parse
 
 from ..http import http_get
 from ..models import MatchCandidate, PaperQuery
-from ..normalize import title_similarity, year_diff
+from ..normalize import title_search_variants, title_similarity, year_diff
 
 CROSSREF_URL = "https://api.crossref.org/works"
 
@@ -89,7 +89,25 @@ class CrossRefSource:
 
     def search(self, query: PaperQuery, *, max_hits: int = 5,
                verbose: bool = False) -> list[MatchCandidate]:
-        q = query.title + (f" {query.author}" if query.author else "")
+        for vi, t_variant in enumerate(title_search_variants(query.title)):
+            candidates = self._search_one_variant(t_variant, query,
+                                                  max_hits=max_hits,
+                                                  verbose=verbose)
+            if candidates:
+                if vi > 0:
+                    msg = (f"matched CrossRef via normalized title "
+                           f"{t_variant!r} (original {query.title!r} "
+                           f"returned no hits)")
+                    print(f"  WARN crossref: {msg}")
+                    for c in candidates:
+                        c.warnings.append(msg)
+                return candidates
+        return []
+
+    def _search_one_variant(self, t_query: str, query: PaperQuery, *,
+                            max_hits: int, verbose: bool
+                            ) -> list[MatchCandidate]:
+        q = t_query + (f" {query.author}" if query.author else "")
         params = urllib.parse.urlencode({
             "query.bibliographic": q,
             "rows": str(max_hits),
@@ -98,14 +116,14 @@ class CrossRefSource:
         try:
             data = http_get(url, verbose=verbose)
         except RuntimeError as e:
-            print(f"  WARN CrossRef search request failed for {query.title!r}: "
+            print(f"  WARN CrossRef search request failed for {q!r}: "
                   f"{type(e).__name__}: {e}")
             return []
 
         try:
             result = json.loads(data)
         except json.JSONDecodeError as e:
-            print(f"  WARN CrossRef returned non-JSON for {query.title!r}: "
+            print(f"  WARN CrossRef returned non-JSON for {q!r}: "
                   f"{type(e).__name__}: {e}")
             return []
 
@@ -116,6 +134,8 @@ class CrossRefSource:
             if not titles:
                 continue
             it_title = titles[0]
+            # Score against the original (un-normalized) title so threshold
+            # logic stays calibrated regardless of which variant we used.
             score = title_similarity(query.title, it_title)
             it_year = _item_year(item)
             yd = year_diff(query.year, it_year)

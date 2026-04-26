@@ -14,7 +14,7 @@ import urllib.parse
 
 from ..http import http_get
 from ..models import MatchCandidate, PaperQuery
-from ..normalize import title_similarity, year_diff
+from ..normalize import title_search_variants, title_similarity, year_diff
 
 DBLP_SEARCH_URL = "https://dblp.org/search/publ/api"
 
@@ -125,10 +125,38 @@ class DBLPSource:
 
     def search(self, query: PaperQuery, *, max_hits: int = 5,
                verbose: bool = False) -> list[MatchCandidate]:
+        """Search DBLP, falling back to normalized title variants if the
+        original returns zero hits.
+
+        DBLP's tokenizer drops characters like '^' silently — a query
+        containing them returns no match even if the paper is indexed.
+        We try variants from `title_search_variants` in order and stop at
+        the first that produces candidates. When a non-original variant
+        wins, every emitted candidate gets a `warnings` entry so the user
+        sees in the run log why the canonical title differs.
+        """
+        for vi, t_variant in enumerate(title_search_variants(query.title)):
+            candidates = self._search_one_variant(t_variant, query,
+                                                  max_hits=max_hits,
+                                                  verbose=verbose)
+            if candidates:
+                if vi > 0:
+                    msg = (f"matched DBLP via normalized title "
+                           f"{t_variant!r} (original {query.title!r} "
+                           f"returned no hits)")
+                    print(f"  WARN dblp: {msg}")
+                    for c in candidates:
+                        c.warnings.append(msg)
+                return candidates
+        return []
+
+    def _search_one_variant(self, t_query: str, query: PaperQuery, *,
+                            max_hits: int, verbose: bool
+                            ) -> list[MatchCandidate]:
         # Query strategies, most specific first
-        queries = [query.title]
+        queries = [t_query]
         if query.author:
-            queries.append(f"{query.title} {query.author}")
+            queries.append(f"{t_query} {query.author}")
 
         all_candidates: list[MatchCandidate] = []
         seen_keys: set[str] = set()
@@ -151,7 +179,9 @@ class DBLPSource:
                 continue
             hits = result.get("result", {}).get("hits", {}).get("hit", [])
 
-            # Optionally upgrade arXiv-only top hit to a journal/conf version
+            # Optionally upgrade arXiv-only top hit to a journal/conf version.
+            # Always score against the *original* title so the threshold
+            # logic stays calibrated, regardless of which variant we used.
             preferred = _prefer_canonical_key(hits, query.title, threshold=0.85)
 
             for h in hits:
@@ -159,8 +189,6 @@ class DBLPSource:
                 hkey = info.get("key", "")
                 if not hkey or hkey in seen_keys:
                     continue
-                # If we have a preferred journal/conf key, only emit that one
-                # at top score (others stay as alternates)
                 seen_keys.add(hkey)
 
                 hit_title = info.get("title", "").rstrip(".")

@@ -64,13 +64,18 @@ class MatchCandidate:
     canonical_key: str             # e.g. "DBLP:journals/tog/Foo24" or DOI
     raw: dict[str, Any] = field(default_factory=dict)  # source-specific payload
     bibtex: str | None = None      # filled lazily on accept
+    warnings: list[str] = field(default_factory=list)
+    """Free-form notes the backend wants to surface to the user, e.g.
+    'matched only after stripping ^ from the title'. Every backend that
+    falls back to a normalized search variant must attach a warning so
+    the run log records why the original query failed."""
 
     def title_match(self, query_title: str, threshold: float = 0.95) -> bool:
         from .normalize import title_similarity
         return title_similarity(self.title, query_title) >= threshold
 
     def to_brief(self) -> dict:
-        return {
+        d = {
             "source": self.source,
             "score": round(self.score, 3),
             "title": self.title,
@@ -78,6 +83,9 @@ class MatchCandidate:
             "year": self.year,
             "canonical_key": self.canonical_key,
         }
+        if self.warnings:
+            d["warnings"] = list(self.warnings)
+        return d
 
 
 @dataclass
