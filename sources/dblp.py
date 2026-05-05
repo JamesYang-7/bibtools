@@ -10,6 +10,7 @@ of the crossref/openalex/arxiv backends.
 from __future__ import annotations
 
 import json
+import re
 import urllib.parse
 
 from ..http import http_get
@@ -17,6 +18,16 @@ from ..models import MatchCandidate, PaperQuery
 from ..normalize import title_search_variants, title_similarity, year_diff
 
 DBLP_SEARCH_URL = "https://dblp.org/search/publ/api"
+
+# DBLP attaches a zero-padded 4-digit homonym suffix (e.g. "Yi Zhou 0023")
+# to disambiguate authors who share a name. The canonical /rec/{key}.bib
+# endpoint strips it; the search-API JSON does not. See
+# https://dblp.org/faq/What+do+the+four+digit+numbers+in+person+names+mean.html
+_DBLP_HOMONYM_SUFFIX = re.compile(r"\s+\d{4}$")
+
+
+def _strip_homonym_suffix(name: str) -> str:
+    return _DBLP_HOMONYM_SUFFIX.sub("", name)
 
 
 def _hit_authors(info: dict) -> list[str]:
@@ -33,7 +44,7 @@ def _hit_authors(info: dict) -> list[str]:
         else:
             name = str(it)
         if name:
-            out.append(name)
+            out.append(_strip_homonym_suffix(name))
     return out
 
 
@@ -107,17 +118,46 @@ def _synthesize_bibtex(info: dict, dblp_id: str) -> str:
     return "\n".join(lines)
 
 
-def _prefer_canonical_key(hits: list[dict], query_title: str,
-                          threshold: float) -> str | None:
-    """Prefer journals/conf entries over arXiv-only ones if both match."""
+def _is_arxiv_key(key: str) -> bool:
+    """DBLP indexes arXiv preprints under the journals/corr/ prefix."""
+    return key.startswith("journals/corr/")
+
+
+def _pick_preferred_key(hits: list[dict], query_title: str,
+                        threshold: float) -> str | None:
+    """Among title-matching hits, return the publication record that should
+    be preferred when DBLP holds multiple records of the same paper.
+
+    Rule (in order):
+      1. Filter to hits whose title sim with the query is >= threshold.
+      2. Pick the most-recently-published record (year DESC).
+      3. Tie-break: prefer non-arXiv (key not starting with journals/corr/).
+
+    The arxiv-vs-conf/journal disambiguation matters because DBLP duplicates
+    every published paper as both an `Informal and Other Publication`
+    (journals/corr/abs-...) and the canonical conf/journal record. Users
+    typically want to cite the canonical record.
+    """
+    matching: list[tuple[int, bool, str]] = []
     for h in hits:
         info = h.get("info", {})
         key = info.get("key", "")
-        if "journals/" in key or "conf/" in key:
-            ht = info.get("title", "").rstrip(".")
-            if title_similarity(query_title, ht) >= threshold:
-                return key
-    return None
+        if not key:
+            continue
+        ht = info.get("title", "").rstrip(".")
+        if title_similarity(query_title, ht) < threshold:
+            continue
+        try:
+            year = int(info.get("year", "0"))
+        except (ValueError, TypeError):
+            year = 0
+        # Sort key: year DESC (so negate), then arxiv-last (False < True).
+        matching.append((-year, _is_arxiv_key(key), key))
+
+    if not matching:
+        return None
+    matching.sort()
+    return matching[0][2]
 
 
 class DBLPSource:
@@ -179,10 +219,15 @@ class DBLPSource:
                 continue
             hits = result.get("result", {}).get("hits", {}).get("hit", [])
 
-            # Optionally upgrade arXiv-only top hit to a journal/conf version.
-            # Always score against the *original* title so the threshold
-            # logic stays calibrated, regardless of which variant we used.
-            preferred = _prefer_canonical_key(hits, query.title, threshold=0.85)
+            # When DBLP returns multiple records of the same paper (a
+            # common case: arXiv preprint + conf/journal version), pick the
+            # canonical record per `_pick_preferred_key`'s rule: latest
+            # year, non-arXiv as tiebreaker. The bonus must outweigh the
+            # year-match bonus below — otherwise an older arXiv version
+            # whose year matches the user's input would still win.
+            # Score against the *original* title so threshold stays
+            # calibrated across normalized search variants.
+            preferred = _pick_preferred_key(hits, query.title, threshold=0.85)
 
             for h in hits:
                 info = h.get("info", {})
@@ -197,7 +242,7 @@ class DBLPSource:
                 if yd == 0:
                     score += 0.05
                 if hkey == preferred:
-                    score += 0.02
+                    score += 0.10
 
                 all_candidates.append(MatchCandidate(
                     source=self.name,

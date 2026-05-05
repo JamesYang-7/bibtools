@@ -8,13 +8,23 @@ from pathlib import Path
 from .bibtex import write_bib_file
 from .interactive import interactive_review
 from .models import MatchCandidate, MatchResult, PaperQuery, SearchReport
-from .normalize import author_match, title_similarity, year_diff
+from .normalize import (author_match, normalize_for_comparison,
+                        title_similarity, year_diff)
 from .sources import DEFAULT_ORDER, SOURCES
 
 # Tunable thresholds — overridable via search_papers() kwargs
 EXACT_TITLE_THRESHOLD = 0.95
 FUZZY_TITLE_THRESHOLD = 0.75
 ACCEPTABLE_YEAR_DIFF = 2          # |query_year - hit_year| considered "close"
+
+# Title-evidence override: when a candidate's title sim with the query is
+# this high, the title alone is treated as decisive. If the title resolves
+# to a single paper across all collected candidates, the chosen candidate
+# is promoted from fuzzy to exact regardless of author/year mismatch.
+# When multiple distinct papers share the title, year diff <= 1 AND
+# first-author match against the query are required to disambiguate.
+TITLE_EVIDENCE_THRESHOLD = 0.95
+TITLE_EVIDENCE_DISAMBIG_YEAR_DIFF = 1
 
 
 def classify(query: PaperQuery, candidate: MatchCandidate, *,
@@ -37,17 +47,20 @@ def classify(query: PaperQuery, candidate: MatchCandidate, *,
     if sim < exact_threshold:
         mismatches.append(f"title similarity {sim:.2f}")
 
-    # Year check
+    # Year check. When title is an exact match and year is off by <= 1,
+    # treat as the arXiv-preprint-vs-conf/journal pattern (same paper,
+    # different publication stage) and don't downgrade. Otherwise an
+    # arXiv hit with a year matching the user's input would beat the
+    # canonical conf/journal record published the year after.
     if query.year and candidate.year:
         yd = year_diff(query.year, candidate.year)
         if yd is None:
             mismatches.append(f"year unparseable: query={query.year} hit={candidate.year}")
         elif yd > 0:
-            tag = " (close)" if yd <= year_tolerance else " (far)"
-            mismatches.append(f"year: {query.year} -> {candidate.year}{tag}")
-            if yd > year_tolerance:
-                # Strong signal of a wrong match; force fuzzy
-                pass
+            tolerable = sim >= exact_threshold and yd <= 1
+            if not tolerable:
+                tag = " (close)" if yd <= year_tolerance else " (far)"
+                mismatches.append(f"year: {query.year} -> {candidate.year}{tag}")
 
     # Author check
     if query.author and candidate.authors:
@@ -60,6 +73,44 @@ def classify(query: PaperQuery, candidate: MatchCandidate, *,
     if mismatches:
         return "fuzzy", mismatches
     return "exact", []
+
+
+def _maybe_promote_via_title_evidence(
+    query: PaperQuery,
+    best: MatchCandidate,
+    all_candidates: list[MatchCandidate],
+) -> bool:
+    """Decide whether `best` (currently fuzzy) deserves promotion to exact.
+
+    Rule:
+      - Collect every candidate whose title sim with the query is
+        >= TITLE_EVIDENCE_THRESHOLD.
+      - Group those candidates by (normalized_title, year). One group
+        means all hits are records of the same paper (different sources,
+        arXiv/conf duplicates, etc.) — title is uniquely decisive, accept.
+      - Multiple groups means distinct papers share this title: require
+        year_diff <= TITLE_EVIDENCE_DISAMBIG_YEAR_DIFF AND first-author
+        surname match between query and `best`. Both query.year and
+        query.author must be non-empty for this branch to fire.
+    """
+    title_matches = [
+        c for c in all_candidates
+        if title_similarity(query.title, c.title) >= TITLE_EVIDENCE_THRESHOLD
+    ]
+    if not title_matches:
+        return False
+
+    groups = {(normalize_for_comparison(c.title), str(c.year))
+              for c in title_matches}
+    if len(groups) <= 1:
+        return True
+
+    if not query.year or not query.author:
+        return False
+    yd = year_diff(query.year, best.year)
+    if yd is None or yd > TITLE_EVIDENCE_DISAMBIG_YEAR_DIFF:
+        return False
+    return author_match(query.author, best.authors)
 
 
 def _search_one(query: PaperQuery, source_names: list[str],
@@ -85,18 +136,30 @@ def _search_one(query: PaperQuery, source_names: list[str],
             status, mismatches = classify(query, cand)
             if status == "weak":
                 continue
-            # Prefer exact > fuzzy; within same status, prefer higher score
-            better = (
-                (status == "exact" and best_status != "exact") or
-                (status == best_status and (best is None or cand.score > best.score))
-            )
+            # Take the first non-weak candidate; thereafter, prefer
+            # exact > fuzzy and break ties by score within the same status.
+            if best is None:
+                better = True
+            else:
+                better = (
+                    (status == "exact" and best_status != "exact") or
+                    (status == best_status and cand.score > best.score)
+                )
             if better:
                 best = cand
                 best_status = status
                 best_mismatches = mismatches
 
-        # Stop cascading the moment we have an exact match
+        # Stop cascading on a hard exact, or on a fuzzy that the
+        # title-evidence override would promote (e.g. correct title +
+        # placeholder author). Otherwise keep cascading to gather more
+        # candidates for disambiguation.
         if best_status == "exact":
+            break
+        if best is not None and best_status == "fuzzy" and \
+                _maybe_promote_via_title_evidence(query, best, all_candidates):
+            best_status = "exact"
+            best_mismatches = []
             break
 
         if api_delay > 0:
@@ -114,6 +177,13 @@ def _search_one(query: PaperQuery, source_names: list[str],
 
     if best is None:
         return MatchResult(query=query, status="not_found", candidates=unique_cands)
+
+    # Final post-cascade promotion check (e.g. when no source surfaced
+    # an exact but the cumulative candidate set still resolves uniquely).
+    if best_status == "fuzzy" and \
+            _maybe_promote_via_title_evidence(query, best, all_candidates):
+        best_status = "exact"
+        best_mismatches = []
 
     if best_status == "exact":
         return MatchResult(query=query, status="exact", chosen=best,
